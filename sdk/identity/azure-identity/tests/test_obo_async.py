@@ -12,7 +12,7 @@ import msal
 from devtools_testutils import is_live
 from devtools_testutils.aio import recorded_by_proxy_async
 from azure.core.pipeline.policies import ContentDecodePolicy, SansIOHTTPPolicy
-from azure.identity import UsernamePasswordCredential
+from azure.identity import TokenCachePersistenceOptions, UsernamePasswordCredential
 from azure.identity._constants import EnvironmentVariables
 from azure.identity._internal.aad_client_base import JWT_BEARER_ASSERTION
 from azure.identity._internal.user_agent import USER_AGENT
@@ -437,6 +437,46 @@ async def test_same_assertion_token_from_shared_cache(get_token_method):
     # a different assertion for the same account must be exchanged rather than served from the cache
     token = await getattr(make_credential("assertion-a2"), get_token_method)("scope")
     assert exchanges == ["assertion-a", "assertion-a2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("get_token_method", GET_TOKEN_METHODS)
+async def test_same_assertion_token_from_persistent_cache(get_token_method, tmp_path):
+    """A new credential with the same user assertion should use the token a previous credential persisted for it.
+
+    Each credential opens its own cache instance backed by the same file, as with TokenCachePersistenceOptions in
+    separate processes.
+    """
+    import msal_extensions
+
+    cache_file = str(tmp_path / "cache.bin")
+    exchanges = []
+
+    async def send(request, **kwargs):
+        exchanges.append(request.body["assertion"])
+        return mock_response(json_payload=build_aad_response(access_token="ACCESS-TOKEN", uid="a", utid="utid"))
+
+    def load_persistent_cache(*_, **__):
+        return msal_extensions.PersistedTokenCache(msal_extensions.FilePersistence(cache_file))
+
+    def make_credential():
+        return OnBehalfOfCredential(
+            "tenant-id",
+            "client-id",
+            client_secret="secret",
+            user_assertion="assertion",
+            transport=Mock(send=send),
+            cache_persistence_options=TokenCachePersistenceOptions(),
+        )
+
+    with patch("azure.identity._internal.aad_client_base._load_persistent_cache", load_persistent_cache):
+        token = await getattr(make_credential(), get_token_method)("scope")
+        assert token.token == "ACCESS-TOKEN"
+
+        token = await getattr(make_credential(), get_token_method)("scope")
+        assert token.token == "ACCESS-TOKEN"
+
+    assert exchanges == ["assertion"], "credential didn't use the token persisted for its user assertion"
 
 
 @pytest.mark.asyncio
